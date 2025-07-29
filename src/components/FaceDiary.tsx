@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, Video, Store as Stop, Play, RotateCcw, FileText, Loader, AlertCircle } from 'lucide-react';
+import { Camera, Video, Store as Stop, Play, RotateCcw, FileText, Loader, AlertCircle, RefreshCw } from 'lucide-react';
 import { FaceDiaryEntry } from '../types';
 import { storage } from '../utils/storage';
 import { faceAnalyzer, EmotionAnalysis } from '../utils/faceAnalysis';
@@ -14,6 +14,8 @@ const FaceDiary: React.FC = () => {
   const [recordingTime, setRecordingTime] = useState(0);
   const [cameraPermission, setCameraPermission] = useState<'granted' | 'denied' | 'prompt' | 'checking'>('checking');
   const [permissionError, setPermissionError] = useState<string | null>(null);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
+  const [useNativeCamera, setUseNativeCamera] = useState(false);
   
   const videoRef = useRef<HTMLVideoElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -55,44 +57,86 @@ const FaceDiary: React.FC = () => {
       setCameraPermission('checking');
       setPermissionError(null);
 
-      // Check if we have camera permission
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' },
-        audio: false
-      });
-      
-      // If we get here, permission was granted
-      setCameraPermission('granted');
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        streamRef.current = stream;
+      if (isNative) {
+        // For native platforms, try to use Capacitor Camera plugin first
+        try {
+          // Test camera access by attempting to take a photo (this will trigger permission request)
+          await takePhoto();
+          setCameraPermission('granted');
+          setUseNativeCamera(true);
+          return;
+        } catch (error: any) {
+          console.log('Native camera not available, falling back to web API:', error);
+          setUseNativeCamera(false);
+        }
+      }
+
+      // Fallback to web API for both web and native platforms
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+            facingMode: 'user',
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          },
+          audio: false
+        });
+        
+        setCameraPermission('granted');
+        setCameraStream(stream);
+        
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          streamRef.current = stream;
+        }
+      } catch (error: any) {
+        console.error('Camera permission error:', error);
+        handleCameraError(error);
       }
     } catch (error: any) {
-      console.error('Camera permission error:', error);
-      
-      if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
-        setCameraPermission('denied');
-        setPermissionError('Camera access was denied. Please enable camera permissions in your browser or device settings.');
-      } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
-        setCameraPermission('denied');
-        setPermissionError('No camera found on this device.');
-      } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
-        setCameraPermission('denied');
-        setPermissionError('Camera is already in use by another application.');
-      } else {
-        setCameraPermission('denied');
-        setPermissionError('Unable to access camera. Please check your device settings.');
-      }
+      console.error('General camera error:', error);
+      handleCameraError(error);
+    }
+  };
+
+  const handleCameraError = (error: any) => {
+    if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
+      setCameraPermission('denied');
+      setPermissionError('Camera access was denied. Please enable camera permissions in your device settings.');
+    } else if (error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError') {
+      setCameraPermission('denied');
+      setPermissionError('No camera found on this device.');
+    } else if (error.name === 'NotReadableError' || error.name === 'TrackStartError') {
+      setCameraPermission('denied');
+      setPermissionError('Camera is already in use by another application.');
+    } else if (error.name === 'OverconstrainedError') {
+      setCameraPermission('denied');
+      setPermissionError('Camera constraints could not be satisfied.');
+    } else {
+      setCameraPermission('denied');
+      setPermissionError('Unable to access camera. Please check your device settings and permissions.');
     }
   };
 
   const startCamera = async () => {
     try {
+      if (useNativeCamera && isNative) {
+        // For native camera, we'll use a different approach
+        // Since Capacitor Camera plugin doesn't provide streaming,
+        // we'll fall back to web API even on native platforms for video recording
+        setUseNativeCamera(false);
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user' },
+        video: { 
+          facingMode: 'user',
+          width: { ideal: 640 },
+          height: { ideal: 480 }
+        },
         audio: false
       });
+      
+      setCameraStream(stream);
       
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
@@ -100,19 +144,35 @@ const FaceDiary: React.FC = () => {
       }
     } catch (error) {
       console.error('Error accessing camera:', error);
-      setPermissionError('Failed to start camera. Please check permissions.');
+      handleCameraError(error);
     }
   };
 
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    if (cameraStream) {
+      cameraStream.getTracks().forEach(track => track.stop());
+      setCameraStream(null);
     }
   };
 
   const startRecording = () => {
-    if (!streamRef.current) return;
+    if (!streamRef.current) {
+      startCamera().then(() => {
+        if (streamRef.current) {
+          beginCountdown();
+        }
+      });
+      return;
+    }
 
+    beginCountdown();
+  };
+
+  const beginCountdown = () => {
     setCountdown(3);
     const countdownInterval = setInterval(() => {
       setCountdown(prev => {
@@ -129,24 +189,63 @@ const FaceDiary: React.FC = () => {
   const beginRecording = () => {
     if (!streamRef.current) return;
 
-    const mediaRecorder = new MediaRecorder(streamRef.current);
-    const chunks: BlobPart[] = [];
+    try {
+      const mediaRecorder = new MediaRecorder(streamRef.current, {
+        mimeType: 'video/webm;codecs=vp9' // Try VP9 first
+      });
+      
+      const chunks: BlobPart[] = [];
 
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        chunks.push(event.data);
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunks.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        const blob = new Blob(chunks, { type: 'video/webm' });
+        setRecordedBlob(blob);
+      };
+
+      mediaRecorder.onerror = (event) => {
+        console.error('MediaRecorder error:', event);
+        setIsRecording(false);
+        setRecordingTime(0);
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start(1000); // Collect data every second
+      setIsRecording(true);
+      setRecordingTime(30); // 30 seconds
+      impact(); // Haptic feedback
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      // Fallback to basic MediaRecorder
+      try {
+        const mediaRecorder = new MediaRecorder(streamRef.current);
+        const chunks: BlobPart[] = [];
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            chunks.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = () => {
+          const blob = new Blob(chunks, { type: 'video/webm' });
+          setRecordedBlob(blob);
+        };
+
+        mediaRecorderRef.current = mediaRecorder;
+        mediaRecorder.start();
+        setIsRecording(true);
+        setRecordingTime(30);
+        impact();
+      } catch (fallbackError) {
+        console.error('Fallback MediaRecorder also failed:', fallbackError);
+        setPermissionError('Video recording is not supported on this device.');
       }
-    };
-
-    mediaRecorder.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      setRecordedBlob(blob);
-    };
-
-    mediaRecorderRef.current = mediaRecorder;
-    mediaRecorder.start();
-    setIsRecording(true);
-    setRecordingTime(30); // 30 seconds
+    }
   };
 
   const stopRecording = () => {
@@ -154,6 +253,7 @@ const FaceDiary: React.FC = () => {
       mediaRecorderRef.current.stop();
       setIsRecording(false);
       setRecordingTime(0);
+      impact();
     }
   };
 
@@ -175,8 +275,10 @@ const FaceDiary: React.FC = () => {
       };
       
       storage.saveFaceDiaryEntry(entry);
+      impact(); // Success feedback
     } catch (error) {
       console.error('Analysis failed:', error);
+      setPermissionError('Analysis failed. Please try again.');
     } finally {
       setIsAnalyzing(false);
     }
@@ -186,7 +288,17 @@ const FaceDiary: React.FC = () => {
     setRecordedBlob(null);
     setAnalysis(null);
     setRecordingTime(0);
+    setPermissionError(null);
     checkCameraPermission();
+  };
+
+  const retryPermission = () => {
+    setPermissionError(null);
+    setCameraPermission('checking');
+    stopCamera();
+    setTimeout(() => {
+      checkCameraPermission();
+    }, 500);
   };
 
   const getScoreColor = (score: number) => {
@@ -209,6 +321,11 @@ const FaceDiary: React.FC = () => {
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
           <h3 className="text-lg font-semibold text-gray-800 mb-2">Checking Camera Access</h3>
           <p className="text-gray-600">Please allow camera access when prompted...</p>
+          {isNative && (
+            <p className="text-sm text-gray-500 mt-2">
+              On first use, your device will ask for camera permission
+            </p>
+          )}
         </div>
       </div>
     );
@@ -236,32 +353,45 @@ const FaceDiary: React.FC = () => {
             <div className="space-y-3 text-sm text-gray-600 mb-6">
               <div className="text-left">
                 <p className="font-medium mb-2">To enable camera access:</p>
-                <ul className="list-disc list-inside space-y-1">
-                  <li>Click the camera icon in your browser's address bar</li>
-                  <li>Select "Allow" for camera permissions</li>
-                  <li>Refresh the page if needed</li>
-                </ul>
-              </div>
-              
-              {isNative && (
-                <div className="text-left mt-4">
-                  <p className="font-medium mb-2">On mobile devices:</p>
+                {isNative ? (
                   <ul className="list-disc list-inside space-y-1">
                     <li>Go to your device Settings</li>
                     <li>Find "Mindfit AI" in your apps</li>
                     <li>Enable Camera permissions</li>
-                    <li>Restart the app</li>
+                    <li>Restart the app if needed</li>
                   </ul>
-                </div>
-              )}
+                ) : (
+                  <ul className="list-disc list-inside space-y-1">
+                    <li>Click the camera icon in your browser's address bar</li>
+                    <li>Select "Allow" for camera permissions</li>
+                    <li>Refresh the page if needed</li>
+                  </ul>
+                )}
+              </div>
             </div>
 
-            <button
-              onClick={checkCameraPermission}
-              className="bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors"
-            >
-              Try Again
-            </button>
+            <div className="flex space-x-3">
+              <button
+                onClick={retryPermission}
+                className="flex-1 bg-blue-600 text-white px-4 py-3 rounded-lg hover:bg-blue-700 transition-colors flex items-center justify-center space-x-2"
+              >
+                <RefreshCw size={16} />
+                <span>Try Again</span>
+              </button>
+              {isNative && (
+                <button
+                  onClick={() => {
+                    // On native, try to open app settings
+                    if (window.open) {
+                      window.open('app-settings:', '_system');
+                    }
+                  }}
+                  className="flex-1 bg-gray-600 text-white px-4 py-3 rounded-lg hover:bg-gray-700 transition-colors"
+                >
+                  Settings
+                </button>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -292,7 +422,7 @@ const FaceDiary: React.FC = () => {
             {/* Countdown Overlay */}
             {countdown > 0 && (
               <div className="absolute inset-0 bg-black bg-opacity-50 flex items-center justify-center rounded-lg">
-                <div className="text-white text-6xl font-bold">{countdown}</div>
+                <div className="text-white text-6xl font-bold animate-pulse">{countdown}</div>
               </div>
             )}
             
@@ -301,6 +431,16 @@ const FaceDiary: React.FC = () => {
               <div className="absolute top-4 right-4 bg-red-600 text-white px-3 py-1 rounded-full flex items-center space-x-2">
                 <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
                 <span className="text-sm font-medium">{recordingTime}s</span>
+              </div>
+            )}
+
+            {/* Camera Status */}
+            {!streamRef.current && !isRecording && (
+              <div className="absolute inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center rounded-lg">
+                <div className="text-center text-white">
+                  <Camera size={48} className="mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">Camera not active</p>
+                </div>
               </div>
             )}
           </div>
@@ -312,7 +452,7 @@ const FaceDiary: React.FC = () => {
                   <button
                     onClick={startRecording}
                     disabled={countdown > 0}
-                    className="flex items-center space-x-2 bg-red-600 text-white px-6 py-3 rounded-lg hover:bg-red-700 transition-colors disabled:bg-gray-300"
+                    className="flex items-center space-x-2 bg-red-600 text-white px-6 py-3 rounded-lg hover:bg-red-700 transition-colors disabled:bg-gray-300 shadow-lg"
                   >
                     <Video size={20} />
                     <span>Start Recording</span>
@@ -320,7 +460,7 @@ const FaceDiary: React.FC = () => {
                 ) : (
                   <button
                     onClick={stopRecording}
-                    className="flex items-center space-x-2 bg-gray-800 text-white px-6 py-3 rounded-lg hover:bg-gray-900 transition-colors"
+                    className="flex items-center space-x-2 bg-gray-800 text-white px-6 py-3 rounded-lg hover:bg-gray-900 transition-colors shadow-lg"
                   >
                     <Stop size={20} />
                     <span>Stop Recording</span>
@@ -332,19 +472,26 @@ const FaceDiary: React.FC = () => {
                 <button
                   onClick={analyzeVideo}
                   disabled={isAnalyzing}
-                  className="flex items-center space-x-2 bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-300"
+                  className="flex items-center space-x-2 bg-blue-600 text-white px-6 py-3 rounded-lg hover:bg-blue-700 transition-colors disabled:bg-gray-300 shadow-lg"
                 >
                   {isAnalyzing ? <Loader size={20} className="animate-spin" /> : <FileText size={20} />}
                   <span>{isAnalyzing ? 'Analyzing...' : 'Analyze Video'}</span>
                 </button>
                 <button
                   onClick={resetRecording}
-                  className="flex items-center space-x-2 bg-gray-600 text-white px-4 py-3 rounded-lg hover:bg-gray-700 transition-colors"
+                  className="flex items-center space-x-2 bg-gray-600 text-white px-4 py-3 rounded-lg hover:bg-gray-700 transition-colors shadow-lg"
                 >
                   <RotateCcw size={20} />
                 </button>
               </div>
             )}
+          </div>
+
+          {/* Instructions */}
+          <div className="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
+            <p className="text-sm text-blue-800 text-center">
+              📹 Look directly at the camera for 30 seconds for best analysis results
+            </p>
           </div>
         </div>
 
@@ -437,6 +584,11 @@ const FaceDiary: React.FC = () => {
                       <div className="text-sm text-gray-600">
                         {entry.timestamp.toLocaleDateString()} at {entry.timestamp.toLocaleTimeString()}
                       </div>
+                      {entry.analysis.depressionIndicators.length > 0 && (
+                        <div className="text-xs text-orange-600 mt-1">
+                          ⚠️ {entry.analysis.depressionIndicators.length} indicators detected
+                        </div>
+                      )}
                     </div>
                     <div className={`text-lg font-bold ${getScoreColor(entry.analysis.overallScore)}`}>
                       {entry.analysis.overallScore}
